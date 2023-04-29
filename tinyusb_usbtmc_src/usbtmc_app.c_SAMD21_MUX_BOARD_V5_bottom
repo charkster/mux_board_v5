@@ -1,0 +1,774 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019 Nathan Conrad
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ */
+
+#define MUX1_EN_PORT    PORT_PA06
+#define MUX1_EN_PIN      PIN_PA06
+#define MUX1_S0_PORT    PORT_PA10
+#define MUX1_S0_PIN      PIN_PA10
+#define MUX1_S1_PORT    PORT_PA09
+#define MUX1_S1_PIN      PIN_PA09
+#define MUX1_S2_PORT    PORT_PA11
+#define MUX1_S2_PIN      PIN_PA11
+#define MUX1_S3_PORT    PORT_PA07
+#define MUX1_S3_PIN      PIN_PA07
+#define MUX2_EN_PORT    PORT_PA03
+#define MUX2_EN_PIN      PIN_PA03
+#define MUX2_S0_PORT    PORT_PA17
+#define MUX2_S0_PIN      PIN_PA17
+#define MUX2_S1_PORT    PORT_PA16
+#define MUX2_S1_PIN      PIN_PA16
+#define MUX2_S2_PORT    PORT_PA05
+#define MUX2_S2_PIN      PIN_PA05
+#define MUX2_S3_PORT    PORT_PA04
+#define MUX2_S3_PIN      PIN_PA04
+#define IDN             "MUX1:SEL 16\nMUX1:EN 1\nhttps://github.com/charkster/mux_board_v5"
+#define IDN_QUERY       "*idn?"
+#define RST_CMD         "*rst"
+#define MUX1_SEL_CMD    "mux1:sel "        // MUX1:SEL
+#define MUX1_SEL_QUERY  "mux1:sel?"        // MUX1:SEL
+#define MUX1_EN_CMD     "mux1:en "         // MUX1:ENable
+#define MUX1_EN_QUERY   "mux1:en?"         // MUX1:ENable
+#define MUX2_SEL_CMD    "mux2:sel "        // MUX2:SEL
+#define MUX2_SEL_QUERY  "mux2:sel?"        // MUX2:SEL
+#define MUX2_EN_CMD     "mux2:en "         // MUX2:ENable
+#define MUX2_EN_QUERY   "mux2:en?"         // MUX2:ENable
+#define END_RESPONSE    "\n"               // USB488
+
+#include <strings.h>
+#include <stdlib.h>     /* atoi */
+#include <stdio.h>      /* fprintf */
+#include "tusb.h"
+#include "bsp/board.h"
+#include "main.h"
+#include "sam.h" /* ADC, DAC, GPIO */
+
+char * get_value(char *in_string);
+void gpio_setup(void);
+
+#if (CFG_TUD_USBTMC_ENABLE_488)
+static usbtmc_response_capabilities_488_t const
+#else
+static usbtmc_response_capabilities_t const
+#endif
+tud_usbtmc_app_capabilities  =
+{
+    .USBTMC_status = USBTMC_STATUS_SUCCESS,
+    .bcdUSBTMC = USBTMC_VERSION,
+    .bmIntfcCapabilities =
+    {
+        .listenOnly = 0,
+        .talkOnly = 0,
+        .supportsIndicatorPulse = 1
+    },
+    .bmDevCapabilities = {
+        .canEndBulkInOnTermChar = 0
+    },
+
+#if (CFG_TUD_USBTMC_ENABLE_488)
+    .bcdUSB488 = USBTMC_488_VERSION,
+    .bmIntfcCapabilities488 =
+    {
+        .supportsTrigger = 1,
+        .supportsREN_GTL_LLO = 0,
+        .is488_2 = 1
+    },
+    .bmDevCapabilities488 =
+    {
+      .SCPI = 1,
+      .SR1 = 0,
+      .RL1 = 0,
+      .DT1 =0,
+    }
+#endif
+};
+
+#define IEEE4882_STB_QUESTIONABLE (0x08u)
+#define IEEE4882_STB_MAV          (0x10u)
+#define IEEE4882_STB_SER          (0x20u)
+#define IEEE4882_STB_SRQ          (0x40u)
+
+//static const char idn[] = "TinyUSB,Seeeduino Xiao,v1\r\n";
+static volatile uint8_t status;
+
+// 0=not query, 1=queried, 2=delay,set(MAV), 3=delay 4=ready?
+// (to simulate delay)
+static volatile uint16_t queryState = 0;
+static volatile uint32_t queryDelayStart;
+static volatile uint32_t bulkInStarted;
+
+static volatile bool idnQuery;
+static volatile bool rst_cmd;
+static volatile bool dac_cmd;
+static volatile bool dac_query;
+static volatile bool adc_query;
+static volatile bool mux_sel_cmd;
+static volatile bool mux_sel_query;
+static volatile bool mux_en_cmd;
+static volatile bool mux_en_query;
+static volatile bool gpio_lev_cmd;
+static volatile bool gpio_lev_query;
+static volatile bool gpio_dir_cmd;
+static volatile bool gpio_dir_query;
+
+
+static uint32_t resp_delay = 125u; // Adjustable delay, to allow for better testing
+static size_t   buffer_len;
+static size_t   buffer_tx_ix;      // for transmitting using multiple transfers
+static uint8_t  buffer[225];       // A few packets long should be enough.
+
+char adc_voltage_str[10];
+char dac_voltage_str[10];
+char mux_en_str[2];
+char mux_sel_str[5];
+char gpio_lev_str[2];
+char gpio_dir_str[5];
+
+static uint32_t  MUX_S0_PORT;
+static uint32_t  MUX_S1_PORT;
+static uint32_t  MUX_S2_PORT;
+static uint32_t  MUX_S3_PORT;
+static uint32_t  MUX_EN_PORT;
+
+static uint32_t  MUX_S0_PIN;
+static uint32_t  MUX_S1_PIN;
+static uint32_t  MUX_S2_PIN;
+static uint32_t  MUX_S3_PIN;
+static uint32_t  MUX_EN_PIN;
+
+static usbtmc_msg_dev_dep_msg_in_header_t rspMsg = {
+    .bmTransferAttributes =
+    {
+      .EOM = 1,
+      .UsingTermChar = 0
+    }
+};
+
+void tud_usbtmc_open_cb(uint8_t interface_id)
+{
+  (void)interface_id;
+  tud_usbtmc_start_bus_read();
+}
+
+#if (CFG_TUD_USBTMC_ENABLE_488)
+usbtmc_response_capabilities_488_t const *
+#else
+usbtmc_response_capabilities_t const *
+#endif
+tud_usbtmc_get_capabilities_cb()
+{
+  return &tud_usbtmc_app_capabilities;
+}
+
+
+bool tud_usbtmc_msg_trigger_cb(usbtmc_msg_generic_t* msg) {
+  (void)msg;
+  // Let trigger set the SRQ
+  status |= IEEE4882_STB_SRQ;
+  return true;
+}
+
+bool tud_usbtmc_msgBulkOut_start_cb(usbtmc_msg_request_dev_dep_out const * msgHeader)
+{
+  (void)msgHeader;
+  buffer_len = 0;
+  if(msgHeader->TransferSize > sizeof(buffer))
+  {
+
+    return false;
+  }
+  return true;
+}
+
+bool tud_usbtmc_msg_data_cb(void *data, size_t len, bool transfer_complete)
+{
+  // If transfer isn't finished, we just ignore it (for now)
+
+  if(len + buffer_len < sizeof(buffer))
+  {
+    memcpy(&(buffer[buffer_len]), data, len);
+    buffer_len += len;
+  }
+  else
+  {
+    return false; // buffer overflow!
+  }
+
+  queryState     = transfer_complete;
+  idnQuery       = false;
+  rst_cmd        = false;
+  dac_cmd        = false;
+  dac_query      = false;
+  adc_query      = false;
+  mux_sel_cmd    = false;
+  mux_sel_query  = false;
+  mux_en_cmd     = false;
+  mux_en_query   = false;
+  gpio_lev_cmd   = false;
+  gpio_lev_query = false;
+  gpio_dir_cmd   = false;
+  gpio_dir_query = false;
+
+  if(transfer_complete && (len >=4) && !strncasecmp(IDN_QUERY,data,5))
+  {
+    idnQuery = true;
+  }
+  else if (transfer_complete && (len >=4) && !strncasecmp(RST_CMD,data,4))
+  {
+    rst_cmd = true;
+    gpio_setup();
+  }
+  else if (transfer_complete && (len >= 8) && !strncasecmp(MUX1_EN_CMD,data,8))
+  {
+    mux_en_cmd  = true;
+    MUX_EN_PORT = MUX1_EN_PORT;
+    MUX_EN_PIN  = MUX1_EN_PIN;
+    PORT->Group[MUX1_EN_PIN/32].DIRSET.reg = MUX1_EN_PORT;
+    PORT->Group[MUX1_S3_PIN/32].DIRSET.reg = MUX1_S3_PORT;
+    PORT->Group[MUX1_S2_PIN/32].DIRSET.reg = MUX1_S2_PORT;
+    PORT->Group[MUX1_S1_PIN/32].DIRSET.reg = MUX1_S1_PORT;
+    PORT->Group[MUX1_S0_PIN/32].DIRSET.reg = MUX1_S0_PORT; // mux enable and sel as outputs
+  }
+  else if (transfer_complete && (len >= 8) && !strncasecmp(MUX2_EN_CMD,data,8))
+  {
+    mux_en_cmd  = true;
+    MUX_EN_PORT = MUX2_EN_PORT;
+    MUX_EN_PIN  = MUX2_EN_PIN;
+    PORT->Group[MUX2_EN_PIN/32].DIRSET.reg = MUX2_EN_PORT;
+    PORT->Group[MUX2_S3_PIN/32].DIRSET.reg = MUX2_S3_PORT;
+    PORT->Group[MUX2_S2_PIN/32].DIRSET.reg = MUX2_S2_PORT;
+    PORT->Group[MUX2_S1_PIN/32].DIRSET.reg = MUX2_S1_PORT;
+    PORT->Group[MUX2_S0_PIN/32].DIRSET.reg = MUX2_S0_PORT; // mux enable and sel as outputs
+  }
+  else if (transfer_complete && (len >= 8) && !strncasecmp(MUX1_EN_QUERY,data,8))
+  {
+    mux_en_query = true;
+    MUX_EN_PORT  = MUX1_EN_PORT;
+    MUX_EN_PIN   = MUX1_EN_PIN;
+  }
+  else if (transfer_complete && (len >= 8) && !strncasecmp(MUX2_EN_QUERY,data,8))
+  {
+    mux_en_query = true;
+    MUX_EN_PORT  = MUX2_EN_PORT;
+    MUX_EN_PIN   = MUX2_EN_PIN;
+  }
+  else if (transfer_complete && (len >= 9) && !strncasecmp(MUX1_SEL_CMD,data,9))
+  {
+    mux_sel_cmd = true;
+    MUX_S0_PORT  = MUX1_S0_PORT;
+    MUX_S1_PORT  = MUX1_S1_PORT;
+    MUX_S2_PORT  = MUX1_S2_PORT;
+    MUX_S3_PORT  = MUX1_S3_PORT;
+    MUX_S0_PIN   = MUX1_S0_PIN;
+    MUX_S1_PIN   = MUX1_S1_PIN;
+    MUX_S2_PIN   = MUX1_S2_PIN;
+    MUX_S3_PIN   = MUX1_S3_PIN;
+  }
+  else if (transfer_complete && (len >= 9) && !strncasecmp(MUX2_SEL_CMD,data,9))
+  {
+    mux_sel_cmd = true;
+    MUX_S0_PORT  = MUX2_S0_PORT;
+    MUX_S1_PORT  = MUX2_S1_PORT;
+    MUX_S2_PORT  = MUX2_S2_PORT;
+    MUX_S3_PORT  = MUX2_S3_PORT;
+    MUX_S0_PIN   = MUX2_S0_PIN;
+    MUX_S1_PIN   = MUX2_S1_PIN;
+    MUX_S2_PIN   = MUX2_S2_PIN;
+    MUX_S3_PIN   = MUX2_S3_PIN;
+  }
+  else if (transfer_complete && (len >= 9) && !strncasecmp(MUX1_SEL_QUERY,data,9))
+  {
+    mux_sel_query = true;
+    MUX_S0_PORT  = MUX1_S0_PORT;
+    MUX_S1_PORT  = MUX1_S1_PORT;
+    MUX_S2_PORT  = MUX1_S2_PORT;
+    MUX_S3_PORT  = MUX1_S3_PORT;
+    MUX_S0_PIN   = MUX1_S0_PIN;
+    MUX_S1_PIN   = MUX1_S1_PIN;
+    MUX_S2_PIN   = MUX1_S2_PIN;
+    MUX_S3_PIN   = MUX1_S3_PIN;
+  }
+  else if (transfer_complete && (len >= 9) && !strncasecmp(MUX2_SEL_QUERY,data,9))
+  {
+    mux_sel_query = true;
+    MUX_S0_PORT  = MUX2_S0_PORT;
+    MUX_S1_PORT  = MUX2_S1_PORT;
+    MUX_S2_PORT  = MUX2_S2_PORT;
+    MUX_S3_PORT  = MUX2_S3_PORT;
+    MUX_S0_PIN   = MUX2_S0_PIN;
+    MUX_S1_PIN   = MUX2_S1_PIN;
+    MUX_S2_PIN   = MUX2_S2_PIN;
+    MUX_S3_PIN   = MUX2_S3_PIN;
+  }
+
+
+  if (mux_en_cmd)
+  {
+    char *ptr_value = get_value(data);
+    int mux_en = atoi(ptr_value);
+    if (mux_en == 1)
+    {
+      PORT->Group[0].OUTSET.reg = MUX_EN_PORT; // drive high value
+    }
+    else if (mux_en == 0)
+    {
+      PORT->Group[0].OUTCLR.reg = MUX_EN_PORT; // drive low value
+    }
+  }
+  else if (mux_en_query)
+  {
+//    if (PORT->Group[0].OUT.reg & MUX_EN_PORT)
+    if (PORT->Group[(MUX_EN_PIN/32)].OUT.reg & MUX_EN_PORT)
+    {
+      strcpy(mux_en_str,"1");
+    }
+    else
+    {
+      strcpy(mux_en_str,"0");
+    }
+  }
+  else if (mux_sel_cmd) 
+  {
+    char *ptr_value = get_value(data);
+    PORT->Group[MUX_S3_PIN/32].DIRSET.reg = MUX_S3_PORT;
+    PORT->Group[MUX_S2_PIN/32].DIRSET.reg = MUX_S2_PORT;
+    PORT->Group[MUX_S1_PIN/32].DIRSET.reg = MUX_S1_PORT;
+    PORT->Group[MUX_S0_PIN/32].DIRSET.reg = MUX_S0_PORT;
+    
+    if (!strncasecmp("10",ptr_value,2))  // 1001 -> 0110
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("11",ptr_value,2))  // 1010 -> 0101
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT; 
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("12",ptr_value,2))  // 1011 -> 0100
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("13",ptr_value,2))  // 1100 -> 0011
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("14",ptr_value,2))  // 1101 -> 0010
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("15",ptr_value,2)) // 1110 - > 0001
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("16",ptr_value,2))  // 1111 -> 0000
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("1",ptr_value,1))  // 0000 -> 1111
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("2",ptr_value,1))  // 0001 -> 1110
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("3",ptr_value,1))  // 0010 -> 1101
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("4",ptr_value,1)) //0011 -> 1100
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("5",ptr_value,1)) // 0100 -> 1011
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("6",ptr_value,1))  // 0101 -> 1010
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("7",ptr_value,1))  // 0110 -> 1001
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("8",ptr_value,1))  // 0111 -> 1000
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTSET.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTCLR.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTCLR.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTCLR.reg =  MUX_S0_PORT;
+    }
+    else if (!strncasecmp("9",ptr_value,1))  // 1000 -> 0111
+    {
+      PORT->Group[(MUX_S3_PIN/32)].OUTCLR.reg =  MUX_S3_PORT;
+      PORT->Group[(MUX_S2_PIN/32)].OUTSET.reg =  MUX_S2_PORT;
+      PORT->Group[(MUX_S1_PIN/32)].OUTSET.reg =  MUX_S1_PORT;
+      PORT->Group[(MUX_S0_PIN/32)].OUTSET.reg =  MUX_S0_PORT;
+    }
+  }
+  else if (mux_sel_query) 
+  {
+    if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT) && (PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT) &&  (PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT) &&  (PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"1");
+    }
+    else if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT) && (PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT) &&  (PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT))
+    {
+      strcpy(mux_sel_str,"2");
+    }
+    else if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT) && (PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT) &&  (PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"3");
+    }
+    else if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT) && (PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT))
+    {
+      strcpy(mux_sel_str,"4");
+    }
+    else if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT) &&  (PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT) &&  (PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"5");
+    }
+    else if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT) &&  (PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT))
+    {
+      strcpy(mux_sel_str,"6");
+    }
+    else if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT) &&  (PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"7");
+    }
+    else if ((PORT->Group[(MUX_S3_PIN/32)].OUT.reg & MUX_S3_PORT))
+    {
+      strcpy(mux_sel_str,"8");
+    }
+    else if ((PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT) &&  (PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT) &&  (PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"9");
+    }
+    else if ((PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT) &&  (PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT))
+    {
+      strcpy(mux_sel_str,"10");
+    }
+    else if ((PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT) &&  (PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"11");
+    }
+    else if ((PORT->Group[(MUX_S2_PIN/32)].OUT.reg & MUX_S2_PORT))
+    {
+      strcpy(mux_sel_str,"12");
+    }
+    else if ((PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT) &&  (PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"13");
+    }
+    else if ((PORT->Group[(MUX_S1_PIN/32)].OUT.reg & MUX_S1_PORT))
+    {
+      strcpy(mux_sel_str,"14");
+    }
+    else if ((PORT->Group[(MUX_S0_PIN/32)].OUT.reg & MUX_S0_PORT))
+    {
+      strcpy(mux_sel_str,"15");
+    }
+    else
+    {
+      strcpy(mux_sel_str,"16");
+    }
+  }
+
+
+  if(transfer_complete && !strncasecmp("delay ",data,5))
+  {
+    queryState = 0;
+    int d = atoi((char*)data + 5);
+    if(d > 10000)
+      d = 10000;
+    if(d<0)
+      d=0;
+    resp_delay = (uint32_t)d;
+  }
+  tud_usbtmc_start_bus_read();
+  return true;
+}
+
+bool tud_usbtmc_msgBulkIn_complete_cb()
+{
+  if((buffer_tx_ix == buffer_len) || idnQuery) // done
+  {
+    status &= (uint8_t)~(IEEE4882_STB_MAV); // clear MAV
+    queryState = 0;
+    bulkInStarted = 0;
+    buffer_tx_ix = 0;
+  }
+  tud_usbtmc_start_bus_read();
+
+  return true;
+}
+
+static unsigned int msgReqLen;
+
+bool tud_usbtmc_msgBulkIn_request_cb(usbtmc_msg_request_dev_dep_in const * request)
+{
+  rspMsg.header.MsgID = request->header.MsgID,
+  rspMsg.header.bTag = request->header.bTag,
+  rspMsg.header.bTagInverse = request->header.bTagInverse;
+  msgReqLen = request->TransferSize;
+
+#ifdef xDEBUG
+  uart_tx_str_sync("MSG_IN_DATA: Requested!\r\n");
+#endif
+  if(queryState == 0 || (buffer_tx_ix == 0))
+  {
+    TU_ASSERT(bulkInStarted == 0);
+    bulkInStarted = 1;
+
+    // > If a USBTMC interface receives a Bulk-IN request prior to receiving a USBTMC command message
+    //   that expects a response, the device must NAK the request (*not stall*)
+  }
+  else
+  {
+    size_t txlen = tu_min32(buffer_len-buffer_tx_ix,msgReqLen);
+    tud_usbtmc_transmit_dev_msg_data(&buffer[buffer_tx_ix], txlen,
+        (buffer_tx_ix+txlen) == buffer_len, false);
+    buffer_tx_ix += txlen;
+  }
+  // Always return true indicating not to stall the EP.
+  return true;
+}
+
+void usbtmc_app_task_iter(void) {
+  switch(queryState) {
+  case 0:
+    break;
+  case 1:
+    queryDelayStart = board_millis();
+    queryState = 2;
+    break;
+  case 2:
+    if( (board_millis() - queryDelayStart) > resp_delay) {
+      queryDelayStart = board_millis();
+      queryState=3;
+      status |= 0x10u; // MAV
+      status |= 0x40u; // SRQ
+    }
+    break;
+  case 3:
+    if( (board_millis() - queryDelayStart) > resp_delay) {
+      queryState = 4;
+    }
+    break;
+  case 4: // time to transmit;
+    if(bulkInStarted && (buffer_tx_ix == 0)) {
+      if(idnQuery)
+      {
+        tud_usbtmc_transmit_dev_msg_data(IDN, tu_min32(sizeof(IDN)-1,msgReqLen),true,false);
+        queryState    = 0;
+        bulkInStarted = 0;
+      }
+      else if (mux_en_query)
+      {
+        tud_usbtmc_transmit_dev_msg_data(mux_en_str, tu_min32(sizeof(mux_en_str)-1,msgReqLen),true,false);
+        queryState    = 0;
+        bulkInStarted = 0;
+      }
+      else if (mux_sel_query)
+      {
+        tud_usbtmc_transmit_dev_msg_data(mux_sel_str, tu_min32(sizeof(mux_sel_str)-1,msgReqLen),true,false);
+        queryState    = 0;
+        bulkInStarted = 0;
+      }
+      else if (rst_cmd || mux_en_cmd || mux_sel_cmd)
+      { 
+        tud_usbtmc_transmit_dev_msg_data(END_RESPONSE, tu_min32(sizeof(END_RESPONSE)-1,msgReqLen),true,false);
+        queryState    = 0;
+        bulkInStarted = 0;
+      }
+      else
+      {
+        buffer_tx_ix = tu_min32(buffer_len,msgReqLen);
+        tud_usbtmc_transmit_dev_msg_data(buffer, buffer_tx_ix, buffer_tx_ix == buffer_len, false);
+      }
+
+      // MAV is cleared in the transfer complete callback.
+    }
+    break;
+  default:
+    TU_ASSERT(false,);
+    return;
+  }
+}
+
+bool tud_usbtmc_initiate_clear_cb(uint8_t *tmcResult)
+{
+  *tmcResult = USBTMC_STATUS_SUCCESS;
+  queryState = 0;
+  bulkInStarted = false;
+  status = 0;
+  return true;
+}
+
+bool tud_usbtmc_check_clear_cb(usbtmc_get_clear_status_rsp_t *rsp)
+{
+  queryState = 0;
+  bulkInStarted = false;
+  status = 0;
+  buffer_tx_ix = 0u;
+  buffer_len = 0u;
+  rsp->USBTMC_status = USBTMC_STATUS_SUCCESS;
+  rsp->bmClear.BulkInFifoBytes = 0u;
+  return true;
+}
+bool tud_usbtmc_initiate_abort_bulk_in_cb(uint8_t *tmcResult)
+{
+  bulkInStarted = 0;
+  *tmcResult = USBTMC_STATUS_SUCCESS;
+  return true;
+}
+bool tud_usbtmc_check_abort_bulk_in_cb(usbtmc_check_abort_bulk_rsp_t *rsp)
+{
+  (void)rsp;
+  tud_usbtmc_start_bus_read();
+  return true;
+}
+
+bool tud_usbtmc_initiate_abort_bulk_out_cb(uint8_t *tmcResult)
+{
+  *tmcResult = USBTMC_STATUS_SUCCESS;
+  return true;
+
+}
+bool tud_usbtmc_check_abort_bulk_out_cb(usbtmc_check_abort_bulk_rsp_t *rsp)
+{
+  (void)rsp;
+  tud_usbtmc_start_bus_read();
+  return true;
+}
+
+void tud_usbtmc_bulkIn_clearFeature_cb(void)
+{
+}
+void tud_usbtmc_bulkOut_clearFeature_cb(void)
+{
+  tud_usbtmc_start_bus_read();
+}
+
+// Return status byte, but put the transfer result status code in the rspResult argument.
+uint8_t tud_usbtmc_get_stb_cb(uint8_t *tmcResult)
+{
+  uint8_t old_status = status;
+  status = (uint8_t)(status & ~(IEEE4882_STB_SRQ)); // clear SRQ
+
+  *tmcResult = USBTMC_STATUS_SUCCESS;
+  // Increment status so that we see different results on each read...
+
+  return old_status;
+}
+
+bool tud_usbtmc_indicator_pulse_cb(tusb_control_request_t const * msg, uint8_t *tmcResult)
+{
+  (void)msg;
+  led_indicator_pulse();
+  *tmcResult = USBTMC_STATUS_SUCCESS;
+  return true;
+}
+
+//---------------------------- New Code ----------------------------//
+
+void gpio_setup(void) {
+  PORT->Group[MUX1_S3_PIN/32].DIRSET.reg = MUX1_S3_PORT;
+  PORT->Group[MUX1_S3_PIN/32].OUTCLR.reg = MUX1_S3_PORT;
+  PORT->Group[MUX1_S2_PIN/32].DIRSET.reg = MUX1_S2_PORT;
+  PORT->Group[MUX1_S2_PIN/32].OUTCLR.reg = MUX1_S2_PORT;
+  PORT->Group[MUX1_S1_PIN/32].DIRSET.reg = MUX1_S1_PORT;
+  PORT->Group[MUX1_S1_PIN/32].OUTCLR.reg = MUX1_S1_PORT;
+  PORT->Group[MUX1_S0_PIN/32].DIRSET.reg = MUX1_S0_PORT;  
+  PORT->Group[MUX1_S0_PIN/32].OUTCLR.reg = MUX1_S0_PORT;
+  PORT->Group[MUX2_S3_PIN/32].DIRSET.reg = MUX2_S3_PORT;
+  PORT->Group[MUX2_S3_PIN/32].OUTCLR.reg = MUX2_S3_PORT;
+  PORT->Group[MUX2_S2_PIN/32].DIRSET.reg = MUX2_S2_PORT;
+  PORT->Group[MUX2_S2_PIN/32].OUTCLR.reg = MUX2_S2_PORT;
+  PORT->Group[MUX2_S1_PIN/32].DIRSET.reg = MUX2_S1_PORT;
+  PORT->Group[MUX2_S1_PIN/32].OUTCLR.reg = MUX2_S1_PORT;
+  PORT->Group[MUX2_S0_PIN/32].DIRSET.reg = MUX2_S0_PORT; 
+  PORT->Group[MUX2_S0_PIN/32].OUTCLR.reg = MUX2_S0_PORT; 
+
+  PORT->Group[MUX1_EN_PIN/32].DIRSET.reg = MUX1_EN_PORT;
+  PORT->Group[MUX1_EN_PIN/32].OUTCLR.reg = MUX1_EN_PORT; // enable is active high 
+  PORT->Group[MUX2_EN_PIN/32].DIRSET.reg = MUX2_EN_PORT;
+  PORT->Group[MUX2_EN_PIN/32].OUTCLR.reg = MUX2_EN_PORT; // enable is active high 
+}
+
+char * get_value(char *in_string) {
+  char *ptr = strrchr(in_string,' ') + 1;
+  return ptr;
+}
+
+char * get_command(char *in_string, char *ptr_value) {
+  uint32_t command_len = ptr_value - in_string - 1;
+  char *command = (char *) malloc(command_len +1);
+  memcpy(command, in_string, command_len);
+  command[command_len] = '\0';
+  return command;
+}
+
