@@ -7,7 +7,7 @@ Custom PCB with SAMD21 QT PY controlling TWO ADG1606BRUZ 16 input muxes! This bo
 
 Check-out my **PDF** [schematic](https://github.com/charkster/mux_board_v5/blob/main/mux_board_v5.pdf) !!
 
-The SAMD21 QT PY can be  programmed with the qt_py_samd21-usbtmc.uf2 file (drag-n-drop) and has the same USBTMC commands that my [Mux Board V1](https://github.com/charkster/mux_board_v1) had. Here is the list:
+The SAMD21 QT PY can be programmed with the appropriate file (drag-n-drop) from the uf2_firmware folder. The same USBTMC commands that my [Mux Board V1](https://github.com/charkster/mux_board_v1) are used. Here is the list:
 
 **MUX1:EN 1** # enable MUX1, a zero will disable the mux
 
