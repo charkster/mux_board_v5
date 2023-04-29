@@ -17,13 +17,13 @@ The SAMD21 QT PY can be  programmed with the qt_py_samd21-usbtmc.uf2 file (drag-
 
 **MUX1:SEL?** # this query returns the presently selected input
 
-***RST** # disables all MUX enables and sets DAC to 0V
+***RST** # disables all MUX enables
 
 ***IDN?** # returns valid commands and this URL
 
-![picture](https://github.com/charkster/mux_board_v3/blob/main/2x10stacking_header.jpg)
+![picture](https://github.com/charkster/mux_board_v5/blob/main/2x16_pin_header_aliexpress.png)
 
-2x10 2.54mm stacking headers can be found on [Aliexpress](https://www.aliexpress.us/item/2251832794527968.html?gatewayAdapt=glo2usa4itemAdapt&_randl_shipto=US)
+2x16 2.54mm stacking headers can be found on [Aliexpress](https://www.aliexpress.us/item/2255800630914427.html)
 
 ![picture](https://github.com/charkster/mux_board_v3/blob/main/SAMD21_QT_PY_.jpg)
 
